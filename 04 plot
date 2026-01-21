@@ -1,0 +1,153 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+# ==========================================
+# 配置部分
+# ==========================================
+INPUT_FILE = 'FINAL_GOLDEN_CANDIDATES_V5.csv'
+FIG1_OUTPUT = 'Figure4_I_Mechanism_Map.pdf'      # 保存为矢量图 PDF
+FIG2_OUTPUT = 'Figure4_J_Motif_Disruption.pdf'   # 保存为矢量图 PDF
+
+# 设置绘图风格 (适合发表)
+sns.set_style("whitegrid")
+plt.rcParams['pdf.fonttype'] = 42 # 确保文字可编辑
+plt.rcParams['ps.fonttype'] = 42
+plt.rcParams['font.family'] = 'Arial' # 期刊常用字体
+
+# ==========================================
+# 1. 数据读取与预处理
+# ==========================================
+df = pd.read_csv(INPUT_FILE)
+
+# 过滤目标基因
+df_clean = df[df['Target_Gene'].isin(['ATG7', 'BNIP3'])].copy()
+
+# 为了避免图上点过于重叠，对于同一个 SNP，我们取 Delta Score 最显著的那行
+# 同时保留 P-value 信息
+df_unique = df_clean.sort_values('Delta_Score').drop_duplicates(['SNP_ID', 'Target_Gene'])
+df_unique = df_unique.sort_values('P_value')
+
+print(f"数据加载完成，共 {len(df_unique)} 个唯一 SNP 用于绘图。")
+
+# ==========================================
+# 2. 绘制 Figure 4I: The Mechanism Map (象限图)
+# ==========================================
+fig, axes = plt.subplots(1, 2, figsize=(14, 6)) # 调整尺寸以适应双图
+
+genes = ['ATG7', 'BNIP3']
+colors = {
+    'PERFECT: Loss of Activation': '#D62728', # 红色 (目标)
+    'Uncertain': '#B0B0B0',                   # 灰色
+    'Gain of Activation': '#2CA02C'           # 绿色
+}
+
+for i, gene in enumerate(genes):
+    ax = axes[i]
+    data = df_unique[df_unique['Target_Gene'] == gene]
+    
+    # 分层绘制，确保红点在最上层
+    # 1. 底层：灰色点
+    sns.scatterplot(data=data[data['Verdict'] == 'Uncertain'], 
+                    x='Delta_Score', y='Beta', 
+                    color=colors['Uncertain'], alpha=0.3, s=40, ax=ax, label='Uncertain / Other', edgecolor=None)
+    
+    # 2. 中层：绿色点
+    sns.scatterplot(data=data[data['Verdict'] == 'Gain of Activation'], 
+                    x='Delta_Score', y='Beta', 
+                    color=colors['Gain of Activation'], alpha=0.6, s=60, ax=ax, label='Gain of Activation')
+    
+    # 3. 顶层：红色目标点 (加黑边框突出)
+    target_data = data[data['Verdict'] == 'PERFECT: Loss of Activation']
+    sns.scatterplot(data=target_data, 
+                    x='Delta_Score', y='Beta', 
+                    color=colors['PERFECT: Loss of Activation'], alpha=1.0, s=100, 
+                    edgecolor='black', linewidth=0.8, ax=ax, label='Loss of Activation (Target)')
+    
+    # 添加中心辅助线
+    ax.axvline(0, linestyle='--', color='black', alpha=0.4)
+    ax.axhline(0, linestyle='--', color='black', alpha=0.4)
+    
+    # 标注 Top 5 显著的 SNP ID
+    top_hits = target_data.sort_values('P_value').head(5)
+    for _, row in top_hits.iterrows():
+        ax.text(row['Delta_Score'] - 0.2, row['Beta'], row['SNP_ID'], 
+                fontsize=8, fontweight='bold', color='black', ha='right', va='center')
+        
+    # 标题与坐标轴
+    ax.set_title(f'{gene}: Smad4 Mechanism Map', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Motif Disruption Score ($\Delta$)\n(Negative = Risk Allele Disrupts Binding)', fontsize=11)
+    
+    if i == 0:
+        ax.set_ylabel('eQTL Effect Size ($\mu$)\n(Negative = Down-regulation)', fontsize=11)
+    else:
+        ax.set_ylabel('') # 第二张图不显示Y轴标签
+
+    # 标注目标区域 (左下角)
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    ax.text(xlim[0] + (xlim[1]-xlim[0])*0.05, ylim[0] + (ylim[1]-ylim[0])*0.05, 
+            'TARGET ZONE:\nLoss of Function', 
+            color='#D62728', fontsize=10, fontweight='bold', ha='left', va='bottom',
+            bbox=dict(facecolor='white', alpha=0.8, edgecolor='#D62728', boxstyle='round,pad=0.5'))
+
+    ax.legend(loc='upper right', fontsize=8, frameon=True)
+
+plt.tight_layout()
+plt.savefig(FIG1_OUTPUT, format='pdf', dpi=300) # 保存矢量图
+print(f"图表 1 已保存为: {FIG1_OUTPUT}")
+
+# ==========================================
+# 3. 绘制 Figure 4J: Motif Disruption Detail (哑铃图)
+# ==========================================
+# 仅展示 BNIP3 中最显著的 Top 10 破坏性位点
+fig2, ax2 = plt.subplots(figsize=(8, 6))
+
+top_atg7 = df_unique[(df_unique['Target_Gene'] == 'BNIP3') & 
+                     (df_unique['Verdict'] == 'PERFECT: Loss of Activation')].sort_values('P_value', ascending=True).head(10)
+
+# 为了绘图美观，我们将 P值最小的放在最上方
+top_atg7 = top_atg7.iloc[::-1] 
+
+# 创建 Y 轴坐标
+y_range = range(len(top_atg7))
+
+# 绘制连接线 (哑铃的杆)
+ax2.hlines(y=y_range, xmin=top_atg7['scoreAlt'], xmax=top_atg7['scoreRef'], color='grey', alpha=0.5, linewidth=2)
+
+# 绘制端点
+# 蓝色：参考等位基因 (强结合)
+ax2.scatter(top_atg7['scoreRef'], y_range, color='#1f77b4', label='Reference Allele (High Affinity)', s=120, zorder=3)
+# 红色：风险等位基因 (弱结合)
+ax2.scatter(top_atg7['scoreAlt'], y_range, color='#D62728', label='Risk Allele (Disrupted Binding)', s=120, zorder=3)
+
+# 添加具体碱基标注 (使用 OA 和 EA 列)
+for i, (_, row) in enumerate(top_atg7.iterrows()):
+    # 在蓝点左侧标注 OA (如 C)
+    ax2.text(row['scoreRef'] + 0.2, i, f"{row['OA']}", 
+             va='center', ha='left', fontsize=10, color='#1f77b4', fontweight='bold')
+    # 在红点右侧标注 EA (如 T)
+    ax2.text(row['scoreAlt'] - 0.2, i, f"{row['EA']}", 
+             va='center', ha='right', fontsize=10, color='#D62728', fontweight='bold')
+
+# 设置坐标轴
+ax2.set_yticks(y_range)
+ax2.set_yticklabels(top_atg7['SNP_ID'], fontsize=11, fontweight='bold')
+ax2.set_xlabel('Smad4 Binding Score (PWM)', fontsize=12)
+ax2.set_title('Impact of BNIP3 Risk Variants on Smad4 Binding', fontsize=14, fontweight='bold')
+
+# 箭头标注说明 (可选，展示变化方向)
+arrow_y = len(top_atg7) - 1
+arrow_start = top_atg7.iloc[-1]['scoreRef']
+arrow_end = top_atg7.iloc[-1]['scoreAlt']
+# ax2.annotate('', xy=(arrow_end, arrow_y + 0.3), xytext=(arrow_start, arrow_y + 0.3),
+#              arrowprops=dict(arrowstyle="->", color='black', lw=1.5))
+# ax2.text((arrow_start+arrow_end)/2, arrow_y + 0.4, 'Disruption', ha='center', fontsize=9)
+
+ax2.legend(loc='lower left', frameon=True)
+ax2.grid(axis='x', linestyle='--', alpha=0.5)
+
+plt.tight_layout()
+plt.savefig(FIG2_OUTPUT, format='pdf', dpi=300) # 保存矢量图
+print(f"图表 2 已保存为: {FIG2_OUTPUT}")
