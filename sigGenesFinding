@@ -1,0 +1,196 @@
+# 筛选sigGenes
+import pandas as pd
+import os
+from datetime import datetime
+
+# 配置：根据你的假说定义目标基因和筛选逻辑
+targets = {
+    "ATG7":  {"file": "LungSCeQTL_Result/spiderResult/ATG7_MP.xlsx",  "axis": "Smad4 Axis",  "expected_beta": "Negative (If disrupting Activator)"},
+    "BNIP3": {"file": "LungSCeQTL_Result/spiderResult/BNIP3_MP.xlsx", "axis": "Smad4 Axis",  "expected_beta": "Negative (If disrupting Activator)"},
+    "PINK1": {"file": "LungSCeQTL_Result/spiderResult/PINK1_MP.xlsx", "axis": "Ddit3 Axis",  "expected_beta": "Negative (If enhancing Repressor)"},
+    "ALKBH4":{"file": "LungSCeQTL_Result/spiderResult/ALKBH4_MP.xlsx","axis": "Nfatc Axis",  "expected_beta": "Negative (If disrupting Activator)"}
+}
+
+# 设定显著性阈值
+P_VALUE_THRESHOLD = 0.05
+
+# 创建保存结果的目录
+output_dir = "LungSCeQTL_Result/significant_results"
+os.makedirs(output_dir, exist_ok=True)
+
+def process_lung_eqtl(target_name, config):
+    file_path = config["file"]
+    if not os.path.exists(file_path):
+        print(f"⚠️ 文件未找到: {file_path}，跳过。")
+        return None
+    
+    print(f"正在处理 {target_name} ({config['axis']})...")
+    
+    try:
+        # 读取 Excel
+        df = pd.read_excel(file_path)
+        
+        # 1. 基础过滤：筛选显著的 SNPs
+        sig_df = df[df['P_value'] < P_VALUE_THRESHOLD].copy()
+        
+        if sig_df.empty:
+            print(f"  -> 在 P < {P_VALUE_THRESHOLD} 下无显著 SNP。")
+            
+            # 即使没有显著结果，也创建一个空的 DataFrame 并保存
+            sig_df = pd.DataFrame(columns=df.columns)
+            sig_df['Effect_Direction'] = None
+            sig_df['Analysis_Timestamp'] = None
+        else:
+            # 2. 整理关键信息
+            sig_df['Effect_Direction'] = sig_df['Beta'].apply(lambda x: "Down-regulation" if x < 0 else "Up-regulation")
+            
+            # 3. 排序：按 P值 最显著排序
+            sig_df = sig_df.sort_values(by='P_value')
+            
+            print(f"  -> 找到 {len(sig_df)} 个显著 SNPs。")
+            
+            # 显示前10个结果供预览
+            if len(sig_df) >= 10:
+                preview_df = sig_df.head(10)[['SNP_ID', 'SNP_Position', 'OA', 'EA', 'Beta', 'P_value', 'Effect_Direction']]
+                print(f"前 10 个最显著的结果:")
+                print(preview_df.to_string(index=False))
+            else:
+                preview_df = sig_df[['SNP_ID', 'SNP_Position', 'OA', 'EA', 'Beta', 'P_value', 'Effect_Direction']]
+                print(f"所有 {len(sig_df)} 个显著结果:")
+                print(preview_df.to_string(index=False))
+        
+        # 4. 添加元数据和统计信息
+        sig_df['Analysis_Timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sig_df['Target_Gene'] = target_name
+        sig_df['Axis'] = config['axis']
+        sig_df['Expected_Beta'] = config['expected_beta']
+        sig_df['P_Value_Threshold'] = P_VALUE_THRESHOLD
+        sig_df['Original_Rows'] = len(df)
+        sig_df['Significant_Rows'] = len(sig_df)
+        
+        # 5. 保存每个基因的完整结果到单独的文件
+        output_file = os.path.join(output_dir, f"{target_name}_significant_results.xlsx")
+        
+        # 创建一个Excel writer，包含两个工作表：所有结果和统计摘要
+        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            # 工作表1: 所有显著结果
+            sig_df.to_excel(writer, sheet_name='All_Significant_SNPs', index=False)
+            
+            # 工作表2: 统计摘要
+            summary_data = {
+                'Statistic': [
+                    'Target Gene', 'Axis', 'Expected Beta', 
+                    'P-value Threshold', 'Total SNPs in Original File',
+                    'Significant SNPs Found', 'Analysis Timestamp'
+                ],
+                'Value': [
+                    target_name, config['axis'], config['expected_beta'],
+                    P_VALUE_THRESHOLD, len(df), len(sig_df),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ]
+            }
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_excel(writer, sheet_name='Summary', index=False)
+            
+            # 工作表3: 按方向分类的统计
+            if 'Effect_Direction' in sig_df.columns and not sig_df.empty:
+                direction_counts = sig_df['Effect_Direction'].value_counts()
+                direction_df = pd.DataFrame({
+                    'Direction': direction_counts.index,
+                    'Count': direction_counts.values,
+                    'Percentage': (direction_counts.values / len(sig_df) * 100).round(2)
+                })
+                direction_df.to_excel(writer, sheet_name='Direction_Stats', index=False)
+        
+        print(f"  ✅ 结果已保存到: {output_file}")
+        print(f"     文件包含: {len(sig_df)} 个显著SNPs")
+        print("-" * 60)
+        
+        return sig_df
+        
+    except Exception as e:
+        print(f"  -> 处理出错: {e}")
+        return None
+
+def create_summary_report(all_results):
+    """创建所有基因的汇总报告"""
+    if not all_results:
+        print("没有有效的结果可以汇总。")
+        return
+    
+    # 收集汇总信息
+    summary_list = []
+    all_significant_snps = []
+    
+    for gene, df in all_results.items():
+        if not df.empty:
+            # 统计信息
+            summary_list.append({
+                'Gene': gene,
+                'Axis': df['Axis'].iloc[0] if 'Axis' in df.columns else targets[gene]['axis'],
+                'Total_SNPs': df['Original_Rows'].iloc[0] if 'Original_Rows' in df.columns else 'N/A',
+                'Significant_SNPs': len(df),
+                'Down_regulated': len(df[df['Effect_Direction'] == 'Down-regulation']) if 'Effect_Direction' in df.columns else 0,
+                'Up_regulated': len(df[df['Effect_Direction'] == 'Up-regulation']) if 'Effect_Direction' in df.columns else 0,
+                'Min_P_value': df['P_value'].min() if 'P_value' in df.columns and not df.empty else 'N/A',
+                'Mean_Beta': df['Beta'].mean() if 'Beta' in df.columns and not df.empty else 'N/A',
+                'File_Saved': f"{gene}_significant_results.xlsx"
+            })
+            
+            # 收集所有显著的SNPs用于汇总文件
+            df_for_summary = df.copy()
+            df_for_summary['Source_Gene'] = gene
+            all_significant_snps.append(df_for_summary)
+    
+    # 创建汇总文件
+    if summary_list:
+        summary_df = pd.DataFrame(summary_list)
+        all_snps_df = pd.concat(all_significant_snps, ignore_index=True) if all_significant_snps else pd.DataFrame()
+        
+        summary_file = os.path.join(output_dir, "ALL_GENES_SUMMARY.xlsx")
+        
+        with pd.ExcelWriter(summary_file, engine='openpyxl') as writer:
+            # 工作表1: 各基因统计摘要
+            summary_df.to_excel(writer, sheet_name='Gene_Summary', index=False)
+            
+            # 工作表2: 所有显著SNPs的汇总
+            if not all_snps_df.empty:
+                # 按P值排序
+                all_snps_df = all_snps_df.sort_values(by='P_value')
+                all_snps_df.to_excel(writer, sheet_name='All_Significant_SNPs', index=False)
+            
+            # 工作表3: 分析参数
+            params_df = pd.DataFrame({
+                'Parameter': ['Analysis Date', 'P-value Threshold', 'Total Genes Analyzed'],
+                'Value': [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                         P_VALUE_THRESHOLD, len(targets)]
+            })
+            params_df.to_excel(writer, sheet_name='Analysis_Parameters', index=False)
+        
+        print(f"\n" + "="*60)
+        print(f"📊 汇总报告已生成: {summary_file}")
+        print(f"   共分析 {len(summary_list)} 个基因，找到 {len(all_snps_df)} 个显著SNPs")
+        print("="*60)
+        
+        # 打印汇总表格
+        print("\n各基因结果摘要:")
+        display_summary = summary_df[['Gene', 'Axis', 'Significant_SNPs', 
+                                     'Down_regulated', 'Up_regulated', 'Min_P_value']]
+        print(display_summary.to_string(index=False))
+
+# 执行主程序
+print("开始分析 eQTL 数据...")
+print(f"保存目录: {output_dir}")
+print("-" * 60)
+
+all_results = {}
+for gene, config in targets.items():
+    res = process_lung_eqtl(gene, config)
+    if res is not None:
+        all_results[gene] = res
+
+# 创建汇总报告
+create_summary_report(all_results)
+
+print(f"\n✅ 分析完成！所有结果已保存到目录: {output_dir}")
+print("   每个基因的结果保存在单独的文件中，同时生成了汇总报告。")
