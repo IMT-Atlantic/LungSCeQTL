@@ -1,0 +1,115 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
+import os
+
+url = "http://ccra.njmu.edu.cn/LungSCeQTL/egenes.jsp"
+
+# geneList
+target_genes = [
+    "SMAD4", "ATG7", "BNIP3", "DDIT3", "KLF2", "FOXO3", "PINK1", "Ube2h"
+]
+
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Origin": "http://ccra.njmu.edu.cn",
+    "Referer": "http://ccra.njmu.edu.cn/LungSCeQTL/egenes.jsp"
+}
+
+# save files
+save_dir = "LungSCeQTL_Result"
+if not os.path.exists(save_dir):
+    os.makedirs(save_dir)
+else:
+    pass
+
+total_data_count = 0
+successful_genes = 0
+
+print(f"start get {len(target_genes)} genes data (only for MP)...\n")
+
+for gene in target_genes:
+    print(f"query: {gene} ... ", end="")
+    
+    gene_data = []
+    
+    try:
+        payload = {
+            "type": "sub",          
+            "Cell_type": "MP",      # Appoint cell 
+            "Gene_ID": "",         
+            "Gene_symbol": gene     # gene symbol
+        }
+        
+        response = requests.post(url, data=payload, headers=headers, timeout=20)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            table = soup.find("table", id="tabid")
+            if table:
+                rows = table.find_all("tr")
+                if len(rows) <= 1:
+                    print("no data")
+                    continue
+
+                gene_data_count = 0
+                
+                for row in rows[1:]:
+                    cols = row.find_all("td")
+                    if len(cols) >= 9: 
+                        row_data = {
+                            "Query_Gene": gene,
+                            "Cell_Type": cols[0].get_text(strip=True),
+                            "SNP_ID": cols[1].get_text(strip=True),
+                            "SNP_Position": cols[2].get_text(strip=True),
+                            "OA": cols[3].get_text(strip=True),  # Other Allele
+                            "EA": cols[4].get_text(strip=True),  # Effect Allele
+                            "Gene_ID": cols[5].get_text(strip=True),
+                            "Gene_Symbol": cols[6].get_text(strip=True),
+                            "Beta": cols[7].get_text(strip=True),
+                            "P_value": cols[8].get_text(strip=True)
+                        }
+                        gene_data.append(row_data)
+                        gene_data_count += 1
+                
+                if gene_data_count > 0:
+                    df_result = pd.DataFrame(gene_data)
+                    df_result['P_value'] = pd.to_numeric(df_result['P_value'], errors='coerce')
+                    df_result = df_result.sort_values(by="P_value")
+                    filename = f"{gene}_{payload['Cell_type']}.xlsx"
+                    filepath = os.path.join(save_dir, filename)
+                    df_result.to_excel(filepath, index=False)
+                    print(f"get {gene_data_count} record and save as {filename}")
+                    
+                    total_data_count += gene_data_count
+                    successful_genes += 1
+                else:
+                    print("no data")
+            else:
+                print("no data and is likely because of the wrong gene name")
+        else:
+            print(f"request failed，code: {response.status_code}")
+
+    except Exception as e:
+        print(f"error: {e}")
+    
+    time.sleep(1)
+
+# ================= 输出汇总信息 =================
+print(f"\n========================================")
+print(f"done！")
+print(f"done genes: {successful_genes}/{len(target_genes)}")
+if successful_genes > 0:
+    print(f"get {total_data_count} sites")
+    print(f"save as {save_dir}/ catagory")
+    print(f"save as: genes_MP.xlsx")
+print(f"========================================")
+
+if successful_genes > 0:
+    print(f"\n生成的文件列表：")
+    for file in os.listdir(save_dir):
+        if file.endswith('.xlsx'):
+            filepath = os.path.join(save_dir, file)
+            file_size = os.path.getsize(filepath)
+            print(f"  - {file} ({file_size/1024:.1f} KB)")
