@@ -1,0 +1,166 @@
+# 1. 设置输出工作目录 (结果将保存在这里)
+setwd("/home/yangpeida/program/LungSCeQTL")
+
+# 2. 加载必要的库
+library(motifbreakR)
+library(SNPlocs.Hsapiens.dbSNP155.GRCh38) # 确保数据库版本匹配
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(MotifDb)
+library(readxl)
+library(dplyr)
+library(stringr)
+library(BiocParallel)
+
+# 3. 定义分析策略 (The Strategy Map)
+strategy_map <- list(
+  "ATG7"   = list(tfs = c("SMAD4"), role = "Activator"),
+  "BNIP3"  = list(tfs = c("SMAD4"), role = "Activator"),
+  "PINK1"  = list(tfs = c("DDIT3", "CEBPZ"), role = "Repressor"), # DDIT3/CHOP
+  "ALKBH4" = list(tfs = c("NFATC1", "NFATC2", "NFATC3", "STAT3"), role = "Activator")
+)
+
+# 4. 主分析函数
+analyze_mechanism <- function(gene_name, config) {
+  message(paste0("\n========================================================"))
+  message(paste0(">>> 正在分析基因: ", gene_name))
+  
+  # --- Step A: 读取数据 ---
+  input_path <- "/mnt/bioBank/publicData/LungSCeQTL/significant_results/"
+  filename <- paste0(input_path, gene_name, "_significant_results.xlsx")
+  
+  if (!file.exists(filename)) {
+    warning(paste("文件不存在:", filename))
+    return(NULL)
+  }
+  
+  tryCatch({
+    data <- read_excel(filename)
+  }, error = function(e) {
+    message("    Excel 读取失败，尝试 CSV...")
+    data <<- read.csv(filename)
+  })
+  
+  if (!"SNP_ID" %in% colnames(data)) {
+    message("    错误: 数据中找不到 'SNP_ID' 列！跳过。")
+    return(NULL)
+  }
+  
+  # 清洗 SNP ID
+  raw_snps <- as.character(data$SNP_ID)
+  clean_snps <- raw_snps %>% str_trim() %>% unique() %>% na.omit() %>% as.character()
+  valid_snps <- clean_snps[str_detect(clean_snps, "^rs\\d+")]
+  
+  message(paste("    有效 SNP ID:", length(valid_snps)))
+  if(length(valid_snps) == 0) return(NULL)
+  
+  # --- Step B: 准备 SNP ---
+  snps.mb <- NULL
+  tryCatch({
+    snps.mb <- snps.from.rsid(rsid = valid_snps,
+                              dbSNP = SNPlocs.Hsapiens.dbSNP155.GRCh38,
+                              search.genome = BSgenome.Hsapiens.UCSC.hg38)
+  }, error = function(e) { message("    SNP转换错误: ", e$message) })
+  
+  if (is.null(snps.mb)) return(NULL)
+  
+  my_motifs <- query(MotifDb, config$tfs)
+  
+  # --- Step C: 运行 Motif 分析 ---
+  results <- NULL
+  tryCatch({
+    results <- motifbreakR(snpList = snps.mb, filterp = TRUE,
+                           pwmList = my_motifs,
+                           threshold = 0.05, 
+                           method = "ic",
+                           bkg = c(A=0.25, C=0.25, G=0.25, T=0.25),
+                           BPPARAM = MulticoreParam(workers = 4))
+  }, error = function(e) { message("    运行错误: ", e$message) })
+  
+  if (is.null(results) || length(results) == 0) {
+    message("    未发现显著的 Motif 改变。")
+    return(NULL)
+  }
+  
+  # --- Step D: 整合与逻辑判决 (ID Rescue & Fix) ---
+  
+  # 1. 抢救 SNP ID (在删除 names 之前！)
+  # 检查 results 是否有 names (通常存储 rsID)
+  if (!is.null(names(results))) {
+    # 强制把 names 写入到 metadata column 'SNP_ID' 中
+    mcols(results)$SNP_ID <- names(results)
+  } else {
+    message("    警告: motifbreakR 结果中未发现 SNP 名称，尝试继续...")
+  }
+  
+  # 2. 现在安全地删除行名 (解决 duplicate error)
+  names(results) <- NULL 
+  
+  # 3. 转换为数据框
+  res_df <- as.data.frame(results)
+  
+  # 4. 二次检查 SNP_ID 列是否存在
+  if (!"SNP_ID" %in% colnames(res_df)) {
+    message("    错误: 无法提取 SNP_ID 列。检查 motifbreakR 输出格式。")
+    return(NULL)
+  }
+  
+  # 选取需要的列
+  desired_cols <- c("SNP_ID", "geneSymbol", "effect", "scoreRef", "scoreAlt", "alleleRef", "alleleAlt")
+  actual_cols <- intersect(desired_cols, colnames(res_df))
+  res_df <- res_df[, actual_cols, drop=FALSE]
+  
+  # 重新匹配 Beta 值 (使用 dplyr::select 避免冲突)
+  beta_info <- data %>% 
+    dplyr::select(SNP_ID, Beta, P_value, OA, EA) %>% 
+    mutate(SNP_ID = str_trim(as.character(SNP_ID))) %>%
+    distinct(SNP_ID, .keep_all = TRUE)
+  
+  # 5. 合并数据 (这时候 res_df 肯定有 SNP_ID 了)
+  # 使用 inner_join 替代 merge，因为它的报错更友善，且默认处理重名列
+  final_df <- inner_join(res_df, beta_info, by="SNP_ID")
+  
+  final_df$Delta_Score <- final_df$scoreAlt - final_df$scoreRef
+  final_df$Verdict <- "Uncertain"
+  
+  # 逻辑判决
+  if (config$role == "Activator") {
+    final_df$Verdict[final_df$Beta < 0 & final_df$Delta_Score < 0] <- "PERFECT: Loss of Activation"
+    final_df$Verdict[final_df$Beta > 0 & final_df$Delta_Score > 0] <- "Gain of Activation"
+  }
+  
+  if (config$role == "Repressor") {
+    final_df$Verdict[final_df$Beta > 0 & final_df$Delta_Score < 0] <- "PERFECT: De-repression"
+    final_df$Verdict[final_df$Beta < 0 & final_df$Delta_Score > 0] <- "PERFECT: Gain of Repression"
+  }
+  
+  output <- final_df %>% 
+    filter(effect == "strong" | str_detect(Verdict, "PERFECT")) %>%
+    arrange(P_value)
+  
+  message(paste("    分析成功！找到", nrow(output), "个潜在机制位点。"))
+  return(output)
+}
+
+# 5. 执行循环
+all_results <- list()
+
+for (gene in names(strategy_map)) {
+  tryCatch({
+    res <- analyze_mechanism(gene, strategy_map[[gene]])
+    if (!is.null(res) && nrow(res) > 0) {
+      res$Target_Gene <- gene
+      all_results[[gene]] <- res
+      write.csv(res, paste0("Validations_", gene, "_Mechanism_ROBUST_V5.csv"), row.names = FALSE)
+      message(paste("    已保存结果"))
+    }
+  }, error = function(e) {
+    message(paste("    处理基因", gene, "时发生未知错误:", e$message))
+  })
+}
+
+# 6. 合并结果
+if (length(all_results) > 0) {
+  final_table <- do.call(rbind, all_results)
+  write.csv(final_table, "FINAL_GOLDEN_CANDIDATES_V5.csv", row.names = FALSE)
+  message("\n>>> 完美！所有分析已完成。请查看 V5 结果。")
+}
